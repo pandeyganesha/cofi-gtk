@@ -107,20 +107,51 @@ pub fn draw_frame(
         };
         cr.set_source_rgba(r, g, b, a);
 
-        // ── Font size ─────────────────────────────────────────────────────────
-        // Selected gets a small extra bump on top of its already-grown size.
-        let size = if is_sel && matches {
+        // ── Font size (intended) ──────────────────────────────────────────────
+        // Selected gets a small extra bump on top of its already-grown peak.
+        let intended_size = if is_sel && matches {
             (peak * 1.12).min(config.theme.max_font_size)
         } else {
             peak
         };
-        cr.set_font_size(size);
 
         // ── Position: centre the text on the scatter point ────────────────────
         let (cx, cy) = app_positions.get(idx).copied().unwrap_or((
             w as f64 / 2.0,
             h as f64 / 2.0,
         ));
+
+        // ── Edge cap (Option B) ───────────────────────────────────────────────
+        //
+        // The text is centred on (cx, cy).  Its half-width must not exceed the
+        // distance from cx to the nearest horizontal screen edge, and likewise
+        // for the vertical axis.  We binary-search for the largest font size in
+        // [min_font_size, intended_size] that keeps the text fully on-screen.
+        //
+        // We reuse the existing `cr` for text measurement (no extra allocations).
+        // 20 iterations gives < 0.001 px precision — more than enough.
+        const EDGE_MARGIN: f64 = 8.0; // px of breathing room from screen edge
+        let max_half_w = (cx.min(w as f64 - cx) - EDGE_MARGIN).max(1.0);
+        let max_half_h = (cy.min(h as f64 - cy) - EDGE_MARGIN).max(1.0);
+
+        let effective_size = {
+            let mut lo   = config.theme.min_font_size.max(1.0);
+            let mut hi   = intended_size;
+            let mut best = lo;
+            for _ in 0..20 {
+                let mid = (lo + hi) / 2.0;
+                cr.set_font_size(mid);
+                let ext = cr.text_extents(&app.name).unwrap();
+                if ext.width() / 2.0 <= max_half_w && ext.height() / 2.0 <= max_half_h {
+                    best = mid;
+                    lo   = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            best
+        };
+        cr.set_font_size(effective_size);
 
         let ext = cr.text_extents(&app.name).unwrap();
         let tx  = cx - ext.x_bearing() - ext.width()  / 2.0;

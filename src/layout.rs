@@ -146,7 +146,7 @@ pub fn compute_base_font_size(
         .unwrap_or(names[0]);
 
     // Use 85 % of cell dimensions as the text budget.
-    fit_text_in_box(reference, cell_w * 0.85, cell_h * 0.85, font_family, min_size, max_size)
+    fit_text_in_box(reference, cell_w * 0.94, cell_h * 0.94, font_family, min_size, max_size)
 }
 
 /// Compute the target size for apps that *match* the current query.
