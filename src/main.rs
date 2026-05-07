@@ -57,7 +57,7 @@ use wayland_client::{
 use cairo::{Format, ImageSurface};
 
 // ── Event loop ────────────────────────────────────────────────────────────────
-use calloop::EventLoop;
+use calloop::{EventLoop, LoopHandle};
 use calloop_wayland_source::WaylandSource;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -93,6 +93,8 @@ struct App {
     layer_surface: Option<LayerSurface>, // the fullscreen overlay surface
     pool: Option<SlotPool>,              // shared memory pool (pixel data)
     keyboard: Option<WlKeyboard>,        // keyboard device handle
+    /// calloop handle — needed to pass to get_keyboard for key-repeat support.
+    loop_handle: LoopHandle<'static, App>,
 
     // ── Screen dimensions ─────────────────────────────────────────────────────
     // Set by the compositor in the first `configure` callback.
@@ -230,6 +232,51 @@ impl App {
             self.selected.map_or(false, |s| self.visible.contains(&s));
         if !current_still_visible {
             self.selected = self.visible.first().copied();
+        }
+    }
+
+    /// Handles both initial key presses and automatically repeated keys.
+    fn handle_key_event(&mut self, qh: &QueueHandle<Self>, event: KeyEvent) {
+        match event.keysym.raw() {
+            KEY_ESCAPE => {
+                self.exit = true;
+            }
+            KEY_RETURN | KEY_KP_ENTER => {
+                if !self.query.is_empty() {
+                    self.launch_selected();
+                    self.exit = true;
+                }
+            }
+            KEY_BACKSPACE => {
+                self.query.pop();
+                self.update_filter();
+                self.draw(qh);
+            }
+            KEY_UP => {
+                self.navigate(nav::Direction::Up);
+                self.draw(qh);
+            }
+            KEY_DOWN => {
+                self.navigate(nav::Direction::Down);
+                self.draw(qh);
+            }
+            KEY_LEFT => {
+                self.navigate(nav::Direction::Left);
+                self.draw(qh);
+            }
+            KEY_RIGHT => {
+                self.navigate(nav::Direction::Right);
+                self.draw(qh);
+            }
+            _ => {
+                if let Some(text) = event.utf8 {
+                    if !text.chars().all(|c| c.is_control()) {
+                        self.query.push_str(&text);
+                        self.update_filter();
+                        self.draw(qh);
+                    }
+                }
+            }
         }
     }
 
@@ -467,9 +514,18 @@ impl SeatHandler for App {
     ) {
         // We only care about the keyboard.
         if capability == Capability::Keyboard && self.keyboard.is_none() {
+            let qh_clone = qh.clone();
             let kb = self
                 .seat_state
-                .get_keyboard(qh, &seat, None) // None = use system keymap
+                .get_keyboard_with_repeat(
+                    qh,
+                    &seat,
+                    None, // use system keymap
+                    self.loop_handle.clone(),
+                    Box::new(move |app, _keyboard, event| {
+                        app.handle_key_event(&qh_clone, event);
+                    }),
+                )
                 .expect("Failed to get keyboard");
             self.keyboard = Some(kb);
         }
@@ -545,62 +601,7 @@ impl KeyboardHandler for App {
         _serial: u32,
         event: KeyEvent,
     ) {
-        // We match on the raw u32 keysym value (see the KEY_* constants above).
-        match event.keysym.raw() {
-            // ── Quit without launching anything ───────────────────────────────
-            KEY_ESCAPE => {
-                self.exit = true;
-            }
-
-            // ── Launch selected app and exit ──────────────────────────────────
-            KEY_RETURN | KEY_KP_ENTER => {
-                // Only launch if the user has typed something AND something is
-                // selected.  If nothing is typed we do nothing (as requested).
-                if !self.query.is_empty() {
-                    self.launch_selected();
-                    self.exit = true;
-                }
-            }
-
-            // ── Delete last character from query ──────────────────────────────
-            KEY_BACKSPACE => {
-                // pop() removes the last *char* (Unicode-safe).
-                self.query.pop();
-                self.update_filter();
-                self.draw(qh);
-            }
-
-            // ── Arrow key navigation ──────────────────────────────────────────
-            KEY_UP => {
-                self.navigate(nav::Direction::Up);
-                self.draw(qh);
-            }
-            KEY_DOWN => {
-                self.navigate(nav::Direction::Down);
-                self.draw(qh);
-            }
-            KEY_LEFT => {
-                self.navigate(nav::Direction::Left);
-                self.draw(qh);
-            }
-            KEY_RIGHT => {
-                self.navigate(nav::Direction::Right);
-                self.draw(qh);
-            }
-
-            // ── Any printable character → append to query ─────────────────────
-            _ => {
-                if let Some(text) = event.utf8 {
-                    // `text` can be multi-byte (e.g. accented characters).
-                    // Skip control characters like Tab.
-                    if !text.chars().all(|c| c.is_control()) {
-                        self.query.push_str(&text);
-                        self.update_filter();
-                        self.draw(qh);
-                    }
-                }
-            }
-        }
+        self.handle_key_event(qh, event);
     }
 
     fn release_key(
@@ -678,6 +679,12 @@ fn main() {
 
     let shm = Shm::bind(&globals, &qh).expect("wl_shm not available");
 
+    // ── Set up the event loop ─────────────────────────────────────────────────
+    // The event loop is created BEFORE App so we can store its handle in App.
+    let mut event_loop: EventLoop<'static, App> =
+        EventLoop::try_new().expect("Failed to create event loop");
+    let loop_handle = event_loop.handle();
+
     // ── Load apps and config ──────────────────────────────────────────────────
     let apps = desktop::load_apps();
     let config = config::Config::load();
@@ -698,6 +705,7 @@ fn main() {
         layer_surface: None,
         pool: None,
         keyboard: None,
+        loop_handle,
 
         width: 0,
         height: 0,
@@ -709,8 +717,6 @@ fn main() {
         visible: Vec::new(),
         selected: initial_selected,
 
-        // These are properly initialised in compute_layout() once we know the
-        // screen size.  Safe empty defaults here.
         app_sizes: Vec::new(),
         app_positions: Vec::new(),
         base_font_size: 12.0,
@@ -747,12 +753,7 @@ fn main() {
     app.layer_surface = Some(layer_surface);
 
     // ── Set up the event loop ─────────────────────────────────────────────────
-    //
-    // calloop is an epoll-based event loop.  WaylandSource bridges the Wayland
-    // socket into calloop so both can share the same thread.
-
-    let mut event_loop: EventLoop<App> = EventLoop::try_new().expect("Failed to create event loop");
-
+    
     WaylandSource::new(conn, event_queue)
         .insert(event_loop.handle())
         .expect("Failed to add Wayland source to event loop");
