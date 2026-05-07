@@ -99,7 +99,7 @@ struct App {
     width: u32,
     height: u32,
 
-    // ── Grid dimensions ───────────────────────────────────────────────────────
+    // ── Grid dimensions (logical, used for navigation) ────────────────────────
     cols: usize,
     rows: usize,
 
@@ -108,6 +108,15 @@ struct App {
     query: String,                    // what the user has typed
     visible: Vec<usize>,              // indices into `apps` that match `query`
     selected: Option<usize>,          // index into `apps` of the highlighted item
+
+    // ── Per-app visual state ───────────────────────────────────────────────────
+    /// Font size for each app.  Only ever grows while a query is active;
+    /// reset to base_font_size when the query is cleared.
+    app_sizes: Vec<f64>,
+    /// Stable scatter positions (cx, cy) in pixels, computed once per screen size.
+    app_positions: Vec<(f64, f64)>,
+    /// The base font size for all apps at startup (all-apps view).
+    base_font_size: f64,
 
     // ── Config / theme ────────────────────────────────────────────────────────
     config: config::Config,
@@ -123,24 +132,45 @@ struct App {
 impl App {
     // ── Layout ────────────────────────────────────────────────────────────────
 
-    /// Recalculate grid dimensions after the screen size or app list changes.
+    /// Recalculate grid dimensions, scatter positions, and base font size.
+    /// Called whenever the screen is configured (or resized).
     fn compute_layout(&mut self) {
         let (c, r) = layout::calculate_grid(self.apps.len(), self.width, self.height);
         self.cols = c;
         self.rows = r;
+
+        // Stable scatter positions — recomputed any time the screen size changes.
+        self.app_positions =
+            layout::scatter_positions(self.apps.len(), self.width, self.height);
+
+        // Base font size: generous startup size using 80th-percentile name.
+        if !self.apps.is_empty() {
+            let names: Vec<&str> = self.apps.iter().map(|a| a.name.as_str()).collect();
+            self.base_font_size = layout::compute_base_font_size(
+                &names,
+                self.width,
+                self.height,
+                &self.config.theme.font_family,
+                self.config.theme.min_font_size,
+                self.config.theme.max_font_size,
+            );
+        }
+
+        // (Re)initialise per-app sizes so they match the new base.
+        self.app_sizes = vec![self.base_font_size; self.apps.len()];
     }
 
     // ── Filtering ─────────────────────────────────────────────────────────────
 
-    /// Run the LCS filter over all apps and update `self.visible`.
-    /// Also fixes up `self.selected` so it always points to a visible app
-    /// (or None if nothing matches).
+    /// Run the subsequence filter, update `self.visible`, grow matching app
+    /// sizes toward the current match target, and fix up `self.selected`.
     fn update_filter(&mut self) {
         if self.query.is_empty() {
-            // No query → "show all" mode.  visible stays empty (our convention
-            // for "everything is shown").
+            // No query → show-all mode.  Reset sticky sizes.
             self.visible.clear();
-            // Keep current selection if it is valid; otherwise start at 0.
+            for s in self.app_sizes.iter_mut() {
+                *s = self.base_font_size;
+            }
             if self.selected.map_or(true, |s| s >= self.apps.len()) {
                 self.selected = if self.apps.is_empty() { None } else { Some(0) };
             }
@@ -156,10 +186,35 @@ impl App {
             .map(|(i, _)| i)
             .collect();
 
-        // If the currently selected app is no longer visible, move to the first
-        // visible one (or None if nothing matches).
-        let current_still_visible = self.selected.map_or(false, |s| self.visible.contains(&s));
+        // Compute the target size for matching apps (based on how many match).
+        if !self.visible.is_empty() {
+            let matching_names: Vec<&str> = self
+                .visible
+                .iter()
+                .map(|&i| self.apps[i].name.as_str())
+                .collect();
 
+            let match_target = layout::compute_match_font_size(
+                &matching_names,
+                self.width,
+                self.height,
+                &self.config.theme.font_family,
+                self.base_font_size,
+                self.config.theme.max_font_size,
+            );
+
+            // Grow matching apps' sizes.  Sizes NEVER decrease.
+            for &i in &self.visible {
+                if match_target > self.app_sizes[i] {
+                    self.app_sizes[i] = match_target;
+                }
+            }
+            // Non-matching apps: their sizes stay at whatever peak they reached.
+        }
+
+        // Fix up selection.
+        let current_still_visible =
+            self.selected.map_or(false, |s| self.visible.contains(&s));
         if !current_still_visible {
             self.selected = self.visible.first().copied();
         }
@@ -227,8 +282,9 @@ impl App {
             &self.visible,
             self.selected,
             &self.query,
-            self.cols,
-            self.rows,
+            &self.app_sizes,
+            &self.app_positions,
+            self.base_font_size,
             self.width,
             self.height,
             &self.config,
@@ -639,6 +695,12 @@ fn main() {
         query: String::new(),
         visible: Vec::new(),
         selected: initial_selected,
+
+        // These are properly initialised in compute_layout() once we know the
+        // screen size.  Safe empty defaults here.
+        app_sizes: Vec::new(),
+        app_positions: Vec::new(),
+        base_font_size: 12.0,
 
         config,
         exit: false,

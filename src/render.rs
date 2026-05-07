@@ -2,16 +2,24 @@
 // render.rs
 //
 // Everything visual lives here.  One public function: draw_frame().
-// It paints a single frame onto a cairo::ImageSurface.
 //
-// Layout recap:
-//   • The screen is divided into cols × rows equally-sized cells.
-//   • Each app's name is drawn centred inside its cell.
-//   • In the "all apps" view (no query) every name is dim.
-//   • When filtering, matching names grow brighter and bigger; non-matches
-//     are simply not drawn.
-//   • The selected app is drawn in the accent colour and slightly larger.
-//   • A search bar appears at the bottom showing the current query.
+// Visual states of each app name
+// ───────────────────────────────
+//   SELECTED   — currently highlighted by arrow keys (in visible set).
+//                Rendered in accent colour, slightly larger.
+//
+//   MATCHING   — matches the current query, not selected.
+//                Bright white, at its current peak_size.
+//
+//   STICKY     — was matching at some point (peak_size > base_size) but no
+//                longer matches the current (longer) query.  Size is frozen at
+//                its peak; colour is a mid-dim so the user can see it used to
+//                grow but is now stale.  NOT selectable.
+//
+//   DIM        — never matched yet (or query just started / cleared).
+//                Very faint; size == base_size.
+//
+// All apps are drawn every frame — only colour and size differ.
 // ─────────────────────────────────────────────────────────────────────────────
 
 use cairo::{Context, FontSlant, FontWeight, ImageSurface};
@@ -22,26 +30,22 @@ use crate::{config::Config, desktop::DesktopEntry};
 
 /// Draw one complete frame.
 ///
-/// `surface`  — Cairo surface to paint onto (ARgb32 format).
-/// `apps`     — all loaded desktop entries (in their shuffled order).
-/// `visible`  — indices into `apps` that match the current query.
-///              Empty means "no query typed yet → show all apps dimly".
-/// `selected` — index into `apps` of the highlighted item, or None.
-/// `query`    — the text the user has typed so far.
-/// `cols/rows`— grid dimensions (computed by layout::calculate_grid).
-/// `w / h`    — screen pixel dimensions.
-/// `config`   — theme settings.
+/// `app_sizes`     — per-app font sizes (peak, never decreases while query active).
+/// `app_positions` — per-app (cx, cy) centre positions in pixels.
+/// `base_font_size`— the size used at startup / when all apps are shown.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_frame(
-    surface:  &ImageSurface,
-    apps:     &[DesktopEntry],
-    visible:  &[usize],
-    selected: Option<usize>,
-    query:    &str,
-    cols:     usize,
-    rows:     usize,
-    w:        u32,
-    h:        u32,
-    config:   &Config,
+    surface:        &ImageSurface,
+    apps:           &[DesktopEntry],
+    visible:        &[usize],   // indices into `apps` that match the query
+    selected:       Option<usize>,
+    query:          &str,
+    app_sizes:      &[f64],
+    app_positions:  &[(f64, f64)],
+    base_font_size: f64,
+    w:              u32,
+    h:              u32,
+    config:         &Config,
 ) {
     let cr = Context::new(surface).expect("cairo context");
 
@@ -50,83 +54,74 @@ pub fn draw_frame(
     cr.set_source_rgba(r, g, b, a);
     cr.paint().unwrap();
 
-    if apps.is_empty() || cols == 0 || rows == 0 {
+    if apps.is_empty() || app_positions.is_empty() || app_sizes.is_empty() {
         draw_search_bar(&cr, query, w, h, config);
         return;
     }
 
-    let cell_w = w as f64 / cols as f64;
-    let cell_h = h as f64 / rows as f64;
+    let filtering = !query.is_empty();
 
-    // Decide which font size to use this frame.
-    // We pass `n_visible` so the font grows as fewer apps remain.
-    let filtering  = !query.is_empty();
-    let n_visible  = if filtering { visible.len() } else { apps.len() };
-
-    let font_size = crate::layout::compute_font_size(
-        n_visible,
-        apps.len(),
-        w, h,
-        config.theme.min_font_size,
-        config.theme.max_font_size,
-    );
-
-    // Build a fast lookup set so we can check visibility in O(1).
-    // (Vec of usize is small enough that a sorted vec + binary search would also
-    //  work, but HashSet is clearest.)
+    // Fast O(1) membership check for the visible set.
     let visible_set: std::collections::HashSet<usize> = visible.iter().copied().collect();
 
-    // ── Draw each app name ────────────────────────────────────────────────────
+    // ── Draw all apps ─────────────────────────────────────────────────────────
     cr.select_font_face(
         &config.theme.font_family,
         FontSlant::Normal,
         FontWeight::Normal,
     );
 
-    for (idx, app) in apps.iter().enumerate() {
-        // In filtering mode, skip non-matching apps entirely (invisible).
-        if filtering && !visible_set.contains(&idx) {
-            continue;
-        }
+    // Use a small epsilon to decide whether this app has ever "grown".
+    let eps = 0.5; // half a pixel — safe float comparison margin
 
-        let is_selected = selected == Some(idx);
+    for idx in 0..apps.len() {
+        let app      = &apps[idx];
+        let is_sel   = selected == Some(idx);
+        let matches  = visible_set.contains(&idx);
+        let peak     = app_sizes.get(idx).copied().unwrap_or(base_font_size);
+        let has_grown = peak > base_font_size + eps;
 
-        // ── Choose colour ─────────────────────────────────────────────────────
-        let [r, g, b, a] = if is_selected {
-            config.theme.highlight
-        } else if filtering {
-            config.theme.text_match
+        // ── Classify visual state ─────────────────────────────────────────────
+        //
+        //  selected  → accent
+        //  matching  → bright
+        //  sticky    → mid-dim (was matching, still has grown size)
+        //  dim       → very faint (never matched or query empty)
+
+        let (r, g, b, a) = if is_sel && matches {
+            let [r, g, b, a] = config.theme.highlight;
+            (r, g, b, a)
+        } else if matches && filtering {
+            let [r, g, b, a] = config.theme.text_match;
+            (r, g, b, a)
+        } else if filtering && has_grown {
+            // Sticky: frozen at peak but visually "stale".
+            // About 40 % of full brightness — clearly different from both
+            // bright matching and the fully-dim never-matched names.
+            let [r, g, b, _] = config.theme.text_match;
+            (r, g, b, 0.38)
         } else {
-            config.theme.text_dim
+            // Dim: never matched (or no query).
+            let [r, g, b, a] = config.theme.text_dim;
+            (r, g, b, a)
         };
         cr.set_source_rgba(r, g, b, a);
 
-        // ── Choose size ───────────────────────────────────────────────────────
-        // Selected item is a bit larger for emphasis; capped at max_font_size.
-        let size = if is_selected {
-            (font_size * 1.25).min(config.theme.max_font_size)
+        // ── Font size ─────────────────────────────────────────────────────────
+        // Selected gets a small extra bump on top of its already-grown size.
+        let size = if is_sel && matches {
+            (peak * 1.12).min(config.theme.max_font_size)
         } else {
-            font_size
+            peak
         };
         cr.set_font_size(size);
 
-        // ── Cell centre ───────────────────────────────────────────────────────
-        let col = idx % cols;
-        let row = idx / cols;
-        let cx  = col as f64 * cell_w + cell_w / 2.0;
-        let cy  = row as f64 * cell_h + cell_h / 2.0;
+        // ── Position: centre the text on the scatter point ────────────────────
+        let (cx, cy) = app_positions.get(idx).copied().unwrap_or((
+            w as f64 / 2.0,
+            h as f64 / 2.0,
+        ));
 
-        // ── Centre the text glyph on (cx, cy) ─────────────────────────────────
-        //
-        // Cairo draws text from the *baseline* at the move_to point.
-        // TextExtents gives us the bounding box relative to the baseline origin:
-        //   x_bearing — x offset from origin to left edge of glyph box
-        //   y_bearing — y offset from origin to top edge  (usually negative)
-        //   width, height — bounding box size
-        //
-        // To centre the bounding box on (cx, cy):
-        //   tx = cx - x_bearing - width/2
-        //   ty = cy - y_bearing - height/2
         let ext = cr.text_extents(&app.name).unwrap();
         let tx  = cx - ext.x_bearing() - ext.width()  / 2.0;
         let ty  = cy - ext.y_bearing() - ext.height() / 2.0;
@@ -149,13 +144,13 @@ fn draw_search_bar(cr: &Context, query: &str, w: u32, h: u32, config: &Config) {
     let bar_h: f64 = 52.0;
     let bar_y = h as f64 - bar_h;
 
-    // Slightly darker pill behind the search text so it stays readable.
-    cr.set_source_rgba(0.0, 0.0, 0.0, 0.55);
+    // Semi-transparent background strip.
+    cr.set_source_rgba(0.0, 0.0, 0.0, 0.60);
     cr.rectangle(0.0, bar_y, w as f64, bar_h);
     cr.fill().unwrap();
 
-    // Draw a thin separator line above the bar.
-    cr.set_source_rgba(1.0, 1.0, 1.0, 0.12);
+    // Thin separator line.
+    cr.set_source_rgba(1.0, 1.0, 1.0, 0.14);
     cr.set_line_width(1.0);
     cr.move_to(0.0, bar_y);
     cr.line_to(w as f64, bar_y);
