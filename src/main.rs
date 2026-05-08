@@ -226,10 +226,25 @@ impl App {
         }
 
         // Fix up selection.
-        let current_still_visible =
-            self.selected.map_or(false, |s| self.visible.contains(&s));
-        if !current_still_visible {
-            self.selected = self.visible.first().copied();
+        // Instead of keeping the current selection just because it's still visible,
+        // we proactively snap to the "best" match for the current query.
+        if self.visible.is_empty() {
+            self.selected = None;
+        } else {
+            let query_lower = self.query.to_lowercase();
+            let best = self.visible.iter().copied().max_by_key(|&i| {
+                let name = self.apps[i].name.to_lowercase();
+                let score = if name.starts_with(&query_lower) {
+                    3 // Prefix matches get highest priority
+                } else if name.contains(&query_lower) {
+                    2 // Substring matches get second priority
+                } else {
+                    1 // Scattered subsequence matches get lowest priority
+                };
+                // Tie-breaker: prefer smaller index (closer to top-left / start of list)
+                (score, -(i as isize))
+            });
+            self.selected = best;
         }
     }
 
