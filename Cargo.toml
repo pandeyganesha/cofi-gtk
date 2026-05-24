@@ -9,20 +9,8 @@ name = "cofi"
 path = "src/main.rs"
 
 [dependencies]
-# Wayland client — the low-level protocol library
-wayland-client = "0.31"
-
-# Smithay Client Toolkit — wraps Wayland boilerplate (layer-shell, keyboard, shm, etc.)
-smithay-client-toolkit = { version = "0.18", default-features = true }
-
-# Event loop that drives everything
-calloop = "0.12"
-
-# Bridges the Wayland event queue into calloop
-calloop-wayland-source = "0.2"
-
-# Cairo 2D graphics — uses the system libcairo (already on your Arch system)
-cairo-rs = "0.18"
+cairo-rs = "0.21.5"
+gtk4 = "0.10.3"
 
 # Config file parsing (TOML)
 serde   = { version = "1", features = ["derive"] }

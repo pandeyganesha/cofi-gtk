@@ -19,7 +19,7 @@
 //   3. Draw all apps at their adjusted centres with per-pixel edge clamping.
 // ─────────────────────────────────────────────────────────────────────────────
 
-use cairo::{Context, FontSlant, FontWeight, ImageSurface};
+use cairo::{Context, FontSlant, FontWeight};
 use crate::{config::Config, desktop::DesktopEntry};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -34,7 +34,7 @@ const EPS: f64 = 0.5;
 
 #[allow(clippy::too_many_arguments)]
 pub fn draw_frame(
-    surface:        &ImageSurface,
+    cr:             &Context,
     apps:           &[DesktopEntry],
     visible:        &[usize],
     selected:       Option<usize>,
@@ -46,8 +46,6 @@ pub fn draw_frame(
     h:              u32,
     config:         &Config,
 ) {
-    let cr = Context::new(surface).expect("cairo context");
-
     // ── Background ────────────────────────────────────────────────────────────
     let [r, g, b, a] = config.theme.bg;
     cr.set_source_rgba(r, g, b, a);

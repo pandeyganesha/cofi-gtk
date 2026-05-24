@@ -1,21 +1,10 @@
-// ─────────────────────────────────────────────────────────────────────────────
-// main.rs — cofi entry point
-//
-// This file does three things:
-//   1. Defines the App struct that holds ALL state.
-//   2. Implements the sctk (Smithay Client Toolkit) delegate traits — these are
-//      the callbacks Wayland calls when something happens (screen resize, key
-//      press, etc.).  They look like boilerplate because most of them do nothing;
-//      only the ones we care about have real logic.
-//   3. Sets up the Wayland layer-shell surface and runs the event loop.
-//
-// If you are new to Rust:
-//   • `&mut self` means we can read AND write to `self`.
-//   • `&self`     means read-only.
-//   • `Option<T>` is either Some(value) or None (Rust has no null).
-//   • `unwrap()`  crashes if the value is None — fine for prototyping.
-//   • `expect("msg")` is the same but prints "msg" before crashing.
-// ─────────────────────────────────────────────────────────────────────────────
+use gtk4 as gtk;
+use gtk::prelude::*;
+use gtk::{Application, ApplicationWindow, DrawingArea, EventControllerKey};
+use gtk::gdk;
+use gtk::glib;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 mod config;
 mod desktop;
@@ -24,126 +13,54 @@ mod lcs;
 mod nav;
 mod render;
 
-// ── sctk imports ──────────────────────────────────────────────────────────────
-use smithay_client_toolkit::{
-    compositor::{CompositorHandler, CompositorState},
-    delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_registry,
-    delegate_seat, delegate_shm,
-    output::{OutputHandler, OutputState},
-    registry::{ProvidesRegistryState, RegistryState},
-    registry_handlers,
-    seat::{
-        keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RepeatInfo},
-        Capability, SeatHandler, SeatState,
-    },
-    shell::{
-        wlr_layer::{
-            Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
-            LayerSurfaceConfigure,
-        },
-        WaylandSurface,
-    },
-    shm::{slot::SlotPool, Shm, ShmHandler},
-};
-use wayland_client::globals::registry_queue_init;
-
-// ── wayland-client imports ────────────────────────────────────────────────────
-use wayland_client::{
-    protocol::{wl_keyboard::WlKeyboard, wl_output, wl_seat, wl_shm, wl_surface},
-    Connection, QueueHandle,
-};
-
-// ── Cairo ─────────────────────────────────────────────────────────────────────
-use cairo::{Format, ImageSurface};
-
-// ── Event loop ────────────────────────────────────────────────────────────────
-use calloop::{EventLoop, LoopHandle};
-use calloop_wayland_source::WaylandSource;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Raw keysym constants
-//
-// We match on the u32 value of each key because it avoids depending on which
-// exact version of the xkbcommon crate exposes which constants.
-// These values come from <X11/keysymdef.h> and never change.
-// ─────────────────────────────────────────────────────────────────────────────
-const KEY_ESCAPE: u32 = 0xff1b;
-const KEY_RETURN: u32 = 0xff0d;
-const KEY_KP_ENTER: u32 = 0xff8d;
-const KEY_BACKSPACE: u32 = 0xff08;
-const KEY_UP: u32 = 0xff52;
-const KEY_DOWN: u32 = 0xff54;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// App — the single struct that holds every piece of state
-// ─────────────────────────────────────────────────────────────────────────────
-
-struct App {
-    // ── sctk state objects (required by the delegate traits) ─────────────────
-    registry_state: RegistryState,
-    seat_state: SeatState,
-    output_state: OutputState,
-    compositor_state: CompositorState,
-    shm: Shm,
-    layer_shell: LayerShell,
-
-    // ── Wayland objects we own ────────────────────────────────────────────────
-    layer_surface: Option<LayerSurface>, // the fullscreen overlay surface
-    pool: Option<SlotPool>,              // shared memory pool (pixel data)
-    keyboard: Option<WlKeyboard>,        // keyboard device handle
-    /// calloop handle — needed to pass to get_keyboard for key-repeat support.
-    loop_handle: LoopHandle<'static, App>,
-
-    // ── Screen dimensions ─────────────────────────────────────────────────────
-    // Set by the compositor in the first `configure` callback.
+struct AppState {
     width: u32,
     height: u32,
-
-    // ── Grid dimensions (logical, used for navigation) ────────────────────────
     cols: usize,
     rows: usize,
-
-    // ── App data ──────────────────────────────────────────────────────────────
-    apps: Vec<desktop::DesktopEntry>, // all desktop entries (shuffled)
-    query: String,                    // what the user has typed
-    visible: Vec<usize>,              // indices into `apps` that match `query`
-    selected: Option<usize>,          // index into `apps` of the highlighted item
-
-    // ── Per-app visual state ───────────────────────────────────────────────────
-    /// Font size for each app.  Only ever grows while a query is active;
-    /// reset to base_font_size when the query is cleared.
+    apps: Vec<desktop::DesktopEntry>,
+    query: String,
+    visible: Vec<usize>,
+    selected: Option<usize>,
     app_sizes: Vec<f64>,
-    /// Stable scatter positions (cx, cy) in pixels, computed once per screen size.
     app_positions: Vec<(f64, f64)>,
-    /// The base font size for all apps at startup (all-apps view).
     base_font_size: f64,
-
-    // ── Config / theme ────────────────────────────────────────────────────────
     config: config::Config,
-
-    // ── Exit flag — set to true to break the event loop ───────────────────────
-    exit: bool,
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// App methods — the actual application logic
-// ─────────────────────────────────────────────────────────────────────────────
+impl AppState {
+    fn new() -> Self {
+        let apps = desktop::load_apps();
+        let config = config::Config::load();
+        let selected = if apps.is_empty() { None } else { Some(0) };
 
-impl App {
-    // ── Layout ────────────────────────────────────────────────────────────────
+        Self {
+            width: 0,
+            height: 0,
+            cols: 1,
+            rows: 1,
+            apps,
+            query: String::new(),
+            visible: Vec::new(),
+            selected,
+            app_sizes: Vec::new(),
+            app_positions: Vec::new(),
+            base_font_size: 12.0,
+            config,
+        }
+    }
 
-    /// Recalculate grid dimensions, scatter positions, and base font size.
-    /// Called whenever the screen is configured (or resized).
     fn compute_layout(&mut self) {
+        if self.width == 0 || self.height == 0 {
+            return;
+        }
+        
         let (c, r) = layout::calculate_grid(self.apps.len(), self.width, self.height);
         self.cols = c;
         self.rows = r;
 
-        // Raw jittered positions — may overlap at base font size.
-        let raw_positions =
-            layout::scatter_positions(self.apps.len(), self.width, self.height);
-
-        // Base font size: fill-ratio formula, naturally bigger with fewer apps.
+        let raw_positions = layout::scatter_positions(self.apps.len(), self.width, self.height);
+        
         if !self.apps.is_empty() {
             let names: Vec<&str> = self.apps.iter().map(|a| a.name.as_str()).collect();
             self.base_font_size = layout::compute_base_font_size(
@@ -154,9 +71,6 @@ impl App {
                 self.config.theme.min_font_size,
                 self.config.theme.max_font_size,
             );
-
-            // Pre-settle positions so startup view has zero overlaps.
-            // This is O(N²) but runs only once per screen configure, not per frame.
             self.app_positions = layout::settle_positions(
                 &names,
                 &raw_positions,
@@ -168,18 +82,13 @@ impl App {
         } else {
             self.app_positions = raw_positions;
         }
-
-        // (Re)initialise per-app sizes so they match the new base.
+        
         self.app_sizes = vec![self.base_font_size; self.apps.len()];
+        self.update_filter();
     }
 
-    // ── Filtering ─────────────────────────────────────────────────────────────
-
-    /// Run the subsequence filter, update `self.visible`, grow matching app
-    /// sizes toward the current match target, and fix up `self.selected`.
     fn update_filter(&mut self) {
         if self.query.is_empty() {
-            // No query → show-all mode.  Reset sticky sizes.
             self.visible.clear();
             for s in self.app_sizes.iter_mut() {
                 *s = self.base_font_size;
@@ -190,7 +99,6 @@ impl App {
             return;
         }
 
-        // Run the subsequence check on every app name.
         self.visible = self
             .apps
             .iter()
@@ -199,14 +107,12 @@ impl App {
             .map(|(i, _)| i)
             .collect();
 
-        // Compute the target size for matching apps (based on how many match).
         if !self.visible.is_empty() {
             let matching_names: Vec<&str> = self
                 .visible
                 .iter()
                 .map(|&i| self.apps[i].name.as_str())
                 .collect();
-
             let match_target = layout::compute_match_font_size(
                 &matching_names,
                 self.width,
@@ -215,19 +121,13 @@ impl App {
                 self.base_font_size,
                 self.config.theme.max_font_size,
             );
-
-            // Grow matching apps' sizes.  Sizes NEVER decrease.
             for &i in &self.visible {
                 if match_target > self.app_sizes[i] {
                     self.app_sizes[i] = match_target;
                 }
             }
-            // Non-matching apps: their sizes stay at whatever peak they reached.
         }
 
-        // Fix up selection.
-        // Instead of keeping the current selection just because it's still visible,
-        // we proactively snap to the "best" match for the current query.
         if self.visible.is_empty() {
             self.selected = None;
         } else {
@@ -235,63 +135,20 @@ impl App {
             let best = self.visible.iter().copied().max_by_key(|&i| {
                 let name = self.apps[i].name.to_lowercase();
                 let score = if name.starts_with(&query_lower) {
-                    3 // Prefix matches get highest priority
+                    3
                 } else if name.contains(&query_lower) {
-                    2 // Substring matches get second priority
+                    2
                 } else {
-                    1 // Scattered subsequence matches get lowest priority
+                    1
                 };
-                // Tie-breaker: prefer smaller index (closer to top-left / start of list)
                 (score, -(i as isize))
             });
             self.selected = best;
         }
     }
 
-    /// Handles both initial key presses and automatically repeated keys.
-    fn handle_key_event(&mut self, qh: &QueueHandle<Self>, event: KeyEvent) {
-        match event.keysym.raw() {
-            KEY_ESCAPE => {
-                self.exit = true;
-            }
-            KEY_RETURN | KEY_KP_ENTER => {
-                if !self.query.is_empty() {
-                    self.launch_selected();
-                    self.exit = true;
-                }
-            }
-            KEY_BACKSPACE => {
-                self.query.pop();
-                self.update_filter();
-                self.draw(qh);
-            }
-            KEY_UP => {
-                self.navigate(nav::Direction::Up);
-                self.draw(qh);
-            }
-            KEY_DOWN => {
-                self.navigate(nav::Direction::Down);
-                self.draw(qh);
-            }
-            _ => {
-                if let Some(text) = event.utf8 {
-                    if !text.chars().all(|c| c.is_control()) {
-                        self.query.push_str(&text);
-                        self.update_filter();
-                        self.draw(qh);
-                    }
-                }
-            }
-        }
-    }
-
-    // ── Navigation ────────────────────────────────────────────────────────────
-
-    /// Move `self.selected` in the given direction through the visible set.
     fn navigate(&mut self, dir: nav::Direction) {
-        // Which apps can we navigate to right now?
         let navigatable: Vec<usize> = if self.query.is_empty() {
-            // No query → all apps are navigatable.
             (0..self.apps.len()).collect()
         } else {
             self.visible.clone()
@@ -301,7 +158,6 @@ impl App {
             return;
         }
 
-        // If current selection is outside the navigatable set, snap to first.
         let current = self
             .selected
             .filter(|s| navigatable.contains(s))
@@ -316,9 +172,6 @@ impl App {
         ));
     }
 
-    // ── Launch ────────────────────────────────────────────────────────────────
-
-    /// Launch the currently selected app (if any).
     fn launch_selected(&self) {
         if let Some(idx) = self.selected {
             if let Some(app) = self.apps.get(idx) {
@@ -327,461 +180,120 @@ impl App {
             }
         }
     }
-
-    // ── Rendering ─────────────────────────────────────────────────────────────
-
-    /// Render the current state to the Wayland surface.
-    /// Called after every keystroke and on initial configure.
-    fn draw(&mut self, qh: &QueueHandle<App>) {
-        if self.width == 0 || self.height == 0 {
-            return; // screen size not known yet
-        }
-
-        // ── Step 1: render with Cairo into a Vec<u8> ──────────────────────────
-        //
-        // We render into a fresh Cairo ImageSurface, then copy its pixel data
-        // into the Wayland shared-memory buffer.  The extra copy (~8 MB for
-        // 1080p) is fast enough for an interactive launcher.
-
-        let mut cairo_surface =
-            ImageSurface::create(Format::ARgb32, self.width as i32, self.height as i32)
-                .expect("Failed to create Cairo surface");
-
-        render::draw_frame(
-            &cairo_surface,
-            &self.apps,
-            &self.visible,
-            self.selected,
-            &self.query,
-            &self.app_sizes,
-            &self.app_positions,
-            self.base_font_size,
-            self.width,
-            self.height,
-            &self.config,
-        );
-
-        cairo_surface.flush();
-
-        // Copy the pixel data out into an owned Vec so we can drop the Cairo
-        // surface and release the borrow before we touch `self.pool`.
-        let pixels: Vec<u8> = {
-            let data = cairo_surface
-                .data()
-                .expect("Failed to read Cairo surface data");
-            data.to_vec() // owned copy
-        };
-        // cairo_surface (and its borrow of pixels) is dropped here.
-        drop(cairo_surface);
-
-        // ── Step 2: write pixels into the Wayland shm buffer ──────────────────
-        //
-        // SlotPool manages a chunk of shared memory.  Each call to
-        // create_buffer() carves out a slot big enough for one frame.
-        // The compositor releases the buffer back to us after it composites it.
-
-        let pool = self.pool.as_mut().expect("Pool not initialised");
-
-        let (buffer, canvas) = pool
-            .create_buffer(
-                self.width as i32,
-                self.height as i32,
-                self.width as i32 * 4, // stride = width × 4 bytes per pixel
-                wl_shm::Format::Argb8888,
-            )
-            .expect("Failed to create Wayland buffer");
-
-        canvas.copy_from_slice(&pixels);
-
-        // canvas is a &mut [u8] that borrows from `pool`.
-        // Explicitly drop it so the mutable borrow on pool ends here,
-        // freeing us to borrow `self.layer_surface` on the next line.
-        drop(canvas);
-
-        // ── Step 3: attach buffer to the surface and commit ───────────────────
-        //
-        // After commit() Hyprland composites the buffer onto the screen.
-        // `layer_surface` and `pool` are different fields of `self`, so Rust
-        // allows us to borrow both (field-level borrow splitting).
-
-        let wl_surf = self
-            .layer_surface
-            .as_ref()
-            .expect("Layer surface not created")
-            .wl_surface();
-
-        buffer
-            .attach_to(wl_surf)
-            .expect("Failed to attach buffer to surface");
-
-        wl_surf.damage_buffer(0, 0, self.width as i32, self.height as i32);
-        wl_surf.commit();
-    }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// sctk delegate implementations
-//
-// These are the callbacks the Wayland event loop invokes.  Most are empty
-// because cofi doesn't need to react to them.  The important ones are:
-//   • LayerShellHandler::configure  — compositor tells us the screen size
-//   • KeyboardHandler::press_key    — user typed something
-// ─────────────────────────────────────────────────────────────────────────────
+fn build_ui(app: &Application) {
+    let window = ApplicationWindow::builder()
+        .application(app)
+        .title("cofi")
+        .decorated(false)
+        .fullscreened(true)
+        .build();
 
-// ── Compositor (surface lifecycle) ───────────────────────────────────────────
-
-impl CompositorHandler for App {
-    fn scale_factor_changed(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
-        _: i32,
-    ) {
-    }
-
-    fn transform_changed(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
-        _: wl_output::Transform,
-    ) {
-    }
-
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
-}
-
-// ── Output (monitor events) ───────────────────────────────────────────────────
-
-impl OutputHandler for App {
-    fn output_state(&mut self) -> &mut OutputState {
-        &mut self.output_state
-    }
-    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-}
-
-// ── Layer Shell ───────────────────────────────────────────────────────────────
-
-impl LayerShellHandler for App {
-    /// The compositor sends `configure` to tell us what size we should be.
-    /// For a fullscreen overlay anchored to all four edges this is the full
-    /// monitor resolution.
-    fn configure(
-        &mut self,
-        _conn: &Connection,
-        qh: &QueueHandle<Self>,
-        _layer: &LayerSurface,
-        configure: LayerSurfaceConfigure,
-        _serial: u32,
-    ) {
-        // Guard: compositor sometimes sends 0,0 on the very first configure.
-        let w = configure.new_size.0;
-        let h = configure.new_size.1;
-        if w == 0 || h == 0 {
-            return;
-        }
-
-        self.width = w;
-        self.height = h;
-
-        eprintln!("[cofi] screen: {w}×{h}");
-
-        // (Re)create the shared memory pool sized for this screen.
-        // ×2 so there is always a free slot while the compositor holds the
-        // previous frame.
-        let pool_bytes = (w as usize) * (h as usize) * 4 * 2;
-        self.pool = Some(
-            SlotPool::new(pool_bytes, &self.shm).expect("Failed to create shared memory pool"),
-        );
-
-        self.compute_layout();
-        self.draw(qh);
-    }
-
-    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
-        self.exit = true;
-    }
-}
-
-// ── Seat (input device management) ───────────────────────────────────────────
-
-impl SeatHandler for App {
-    fn seat_state(&mut self) -> &mut SeatState {
-        &mut self.seat_state
-    }
-
-    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
-
-    /// Called when a new input capability (keyboard, pointer, …) is announced.
-    fn new_capability(
-        &mut self,
-        _conn: &Connection,
-        qh: &QueueHandle<Self>,
-        seat: wl_seat::WlSeat,
-        capability: Capability,
-    ) {
-        // We only care about the keyboard.
-        if capability == Capability::Keyboard && self.keyboard.is_none() {
-            let qh_clone = qh.clone();
-            let kb = self
-                .seat_state
-                .get_keyboard_with_repeat(
-                    qh,
-                    &seat,
-                    None, // use system keymap
-                    self.loop_handle.clone(),
-                    Box::new(move |app, _keyboard, event| {
-                        app.handle_key_event(&qh_clone, event);
-                    }),
-                )
-                .expect("Failed to get keyboard");
-            self.keyboard = Some(kb);
-        }
-    }
-
-    fn remove_capability(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: wl_seat::WlSeat,
-        capability: Capability,
-    ) {
-        if capability == Capability::Keyboard {
-            if let Some(kb) = self.keyboard.take() {
-                kb.release();
-            }
-        }
-    }
-
-    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
-}
-
-// ── Keyboard ──────────────────────────────────────────────────────────────────
-
-impl KeyboardHandler for App {
-    fn enter(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &WlKeyboard,
-        _: &wl_surface::WlSurface,
-        _serial: u32,
-        _raw: &[u32],
-        _syms: &[Keysym],
-    ) {
-    }
-
-    fn leave(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &WlKeyboard,
-        _: &wl_surface::WlSurface,
-        _serial: u32,
-    ) {
-    }
-
-    fn update_modifiers(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &WlKeyboard,
-        _serial: u32,
-        _mods: Modifiers,
-    ) {
-    }
-
-    fn update_repeat_info(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &WlKeyboard,
-        _info: RepeatInfo,
-    ) {
-    }
-
-    /// This is where all the magic happens — every key press lands here.
-    fn press_key(
-        &mut self,
-        _conn: &Connection,
-        qh: &QueueHandle<Self>,
-        _keyboard: &WlKeyboard,
-        _serial: u32,
-        event: KeyEvent,
-    ) {
-        self.handle_key_event(qh, event);
-    }
-
-    fn release_key(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &WlKeyboard,
-        _serial: u32,
-        _event: KeyEvent,
-    ) {
-    }
-}
-
-// ── SHM ───────────────────────────────────────────────────────────────────────
-
-impl ShmHandler for App {
-    fn shm_state(&mut self) -> &mut Shm {
-        &mut self.shm
-    }
-}
-
-// ── Registry ──────────────────────────────────────────────────────────────────
-
-impl ProvidesRegistryState for App {
-    fn registry(&mut self) -> &mut RegistryState {
-        &mut self.registry_state
-    }
-    // Tells sctk to automatically update OutputState and SeatState from the
-    // registry (so new monitors and seats are tracked for free).
-    registry_handlers![OutputState, SeatState];
-}
-
-// ── Delegate macros ───────────────────────────────────────────────────────────
-//
-// These macros wire up all the Wayland Dispatch<Protocol, _> implementations
-// that sctk needs internally.  Without them the event loop won't know how to
-// route protocol events to our handler methods above.
-
-delegate_compositor!(App);
-delegate_output!(App);
-delegate_layer!(App);
-delegate_seat!(App);
-delegate_keyboard!(App);
-delegate_shm!(App);
-delegate_registry!(App);
-
-// ─────────────────────────────────────────────────────────────────────────────
-// main()
-// ─────────────────────────────────────────────────────────────────────────────
-
-fn main() {
-    // ── Connect to the Wayland compositor ────────────────────────────────────
-    //
-    // Reads $WAYLAND_DISPLAY (usually "wayland-0") and opens a socket to
-    // Hyprland.  Fails loudly if the display is not set.
-    let conn =
-        Connection::connect_to_env().expect("Cannot connect to Wayland. Is $WAYLAND_DISPLAY set?");
-
-    // ── Discover available global interfaces ──────────────────────────────────
-    //
-    // `registry_queue_init` sends a `wl_display.get_registry` and does a
-    // blocking roundtrip so `globals` already contains everything by the time
-    // we return.
-    let (globals, event_queue) =
-        registry_queue_init::<App>(&conn).expect("Failed to initialise Wayland registry");
-
-    let qh = event_queue.handle();
-
-    // ── Bind the protocols we need ────────────────────────────────────────────
-    let compositor_state =
-        CompositorState::bind(&globals, &qh).expect("wl_compositor not available");
-
-    let layer_shell = LayerShell::bind(&globals, &qh)
-        .expect("zwlr_layer_shell_v1 not available — is Hyprland running?");
-
-    let shm = Shm::bind(&globals, &qh).expect("wl_shm not available");
-
-    // ── Set up the event loop ─────────────────────────────────────────────────
-    // The event loop is created BEFORE App so we can store its handle in App.
-    let mut event_loop: EventLoop<'static, App> =
-        EventLoop::try_new().expect("Failed to create event loop");
-    let loop_handle = event_loop.handle();
-
-    // ── Load apps and config ──────────────────────────────────────────────────
-    let apps = desktop::load_apps();
-    let config = config::Config::load();
-
-    eprintln!("[cofi] loaded {} applications", apps.len());
-
-    let initial_selected = if apps.is_empty() { None } else { Some(0) };
-
-    // ── Build application state ───────────────────────────────────────────────
-    let mut app = App {
-        registry_state: RegistryState::new(&globals),
-        seat_state: SeatState::new(&globals, &qh),
-        output_state: OutputState::new(&globals, &qh),
-        compositor_state,
-        shm,
-        layer_shell,
-
-        layer_surface: None,
-        pool: None,
-        keyboard: None,
-        loop_handle,
-
-        width: 0,
-        height: 0,
-        cols: 1,
-        rows: 1,
-
-        apps,
-        query: String::new(),
-        visible: Vec::new(),
-        selected: initial_selected,
-
-        app_sizes: Vec::new(),
-        app_positions: Vec::new(),
-        base_font_size: 12.0,
-
-        config,
-        exit: false,
-    };
-
-    // ── Create the layer-shell surface ────────────────────────────────────────
-    //
-    // A layer-shell surface is a special Wayland surface that can be pinned to
-    // the screen edges and placed above (or below) normal windows.  We use the
-    // OVERLAY layer so cofi appears above everything including other overlays.
-
-    let wl_surface = app.compositor_state.create_surface(&qh);
-
-    let layer_surface = app.layer_shell.create_layer_surface(
-        &qh,
-        wl_surface,
-        Layer::Overlay, // above all normal windows
-        Some("cofi"),   // namespace — used in hyprland.conf layerrule
-        None,           // output: None = the focused monitor
+    let provider = gtk::CssProvider::new();
+    provider.load_from_data("window { background: transparent; }");
+    gtk::style_context_add_provider_for_display(
+        &gdk::Display::default().expect("Could not connect to a display."),
+        &provider,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
 
-    // Anchor to all four edges → the compositor sizes us to fill the monitor.
-    layer_surface.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
-    layer_surface.set_size(0, 0); // 0,0 = let compositor decide
-    layer_surface.set_exclusive_zone(-1); // don't push panels away
-    layer_surface.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+    let state = Rc::new(RefCell::new(AppState::new()));
+    let drawing_area = DrawingArea::new();
+    drawing_area.set_focusable(true);
+    drawing_area.grab_focus();
 
-    // Commit the surface so the compositor sends us a `configure` event with
-    // the actual screen dimensions.
-    layer_surface.commit();
-    app.layer_surface = Some(layer_surface);
-
-    // ── Set up the event loop ─────────────────────────────────────────────────
-    
-    WaylandSource::new(conn, event_queue)
-        .insert(event_loop.handle())
-        .expect("Failed to add Wayland source to event loop");
-
-    // ── Run ───────────────────────────────────────────────────────────────────
-    //
-    // `dispatch(None, &mut app)` blocks until at least one event fires, then
-    // calls all the relevant handler methods above.  We loop until `app.exit`
-    // is set to true.
-
-    loop {
-        event_loop
-            .dispatch(None, &mut app)
-            .expect("Event loop error");
-
-        if app.exit {
-            break;
+    let state_draw = state.clone();
+    drawing_area.set_draw_func(move |_area, cr, width, height| {
+        let mut s = state_draw.borrow_mut();
+        if s.width != width as u32 || s.height != height as u32 {
+            s.width = width as u32;
+            s.height = height as u32;
+            s.compute_layout();
         }
-    }
+
+        render::draw_frame(
+            cr,
+            &s.apps,
+            &s.visible,
+            s.selected,
+            &s.query,
+            &s.app_sizes,
+            &s.app_positions,
+            s.base_font_size,
+            s.width,
+            s.height,
+            &s.config,
+        );
+    });
+
+    let state_key = state.clone();
+    let window_weak = window.downgrade();
+    
+    let key_controller = EventControllerKey::new();
+    key_controller.connect_key_pressed(move |controller, keyval, _keycode, _state| {
+        let mut s = state_key.borrow_mut();
+        let mut handled = true;
+
+        match keyval {
+            gdk::Key::Escape => {
+                if let Some(w) = window_weak.upgrade() {
+                    w.close();
+                }
+            }
+            gdk::Key::Return | gdk::Key::KP_Enter => {
+                if !s.query.is_empty() {
+                    s.launch_selected();
+                    if let Some(w) = window_weak.upgrade() {
+                        w.close();
+                    }
+                }
+            }
+            gdk::Key::BackSpace => {
+                s.query.pop();
+                s.update_filter();
+                controller.widget().unwrap().queue_draw();
+            }
+            gdk::Key::Up => {
+                s.navigate(nav::Direction::Up);
+                controller.widget().unwrap().queue_draw();
+            }
+            gdk::Key::Down => {
+                s.navigate(nav::Direction::Down);
+                controller.widget().unwrap().queue_draw();
+            }
+            _ => {
+                if let Some(c) = keyval.to_unicode() {
+                    if !c.is_control() {
+                        s.query.push(c);
+                        s.update_filter();
+                        controller.widget().unwrap().queue_draw();
+                    } else {
+                        handled = false;
+                    }
+                } else {
+                    handled = false;
+                }
+            }
+        }
+        
+        if handled {
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+
+    drawing_area.add_controller(key_controller);
+    window.set_child(Some(&drawing_area));
+    window.present();
+}
+
+fn main() -> glib::ExitCode {
+    let app = Application::builder()
+        .application_id("com.github.pandeyganesha.cofi")
+        .build();
+
+    app.connect_activate(build_ui);
+    app.run()
 }
