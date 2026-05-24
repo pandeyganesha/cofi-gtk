@@ -15,3 +15,15 @@ gtk4 = "0.10.3"
 # Config file parsing (TOML)
 serde   = { version = "1", features = ["derive"] }
 toml    = "0.8"
+
+[package.metadata.deb]
+maintainer = "PandeyGanesha <pandeyganesha@gmail.com>"
+copyright = "2024"
+license-file = []
+depends = "$auto, libgtk-4-1"
+extended-description = "A universal, blurred transparent app launcher for Linux powered by GTK4."
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/cofi", "usr/bin/", "755"],
+]

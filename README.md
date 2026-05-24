@@ -31,7 +31,31 @@ sudo dnf install rust cargo gtk4-devel
 
 ---
 
-## Build & Install
+## Installation
+
+### Method 1: Pre-built Package (Easiest)
+
+If you don't want to compile the code yourself, you can download a pre-built package from the **Releases** page on GitHub.
+
+**For Ubuntu / Debian:**
+1. Download the `.deb` file from the [Releases page](https://github.com/pandeyganesha/cofi-gtk/releases).
+2. Install it via apt to automatically handle GTK dependencies:
+   ```bash
+   sudo apt install ./cofi_*.deb
+   ```
+
+**For other Distros:**
+1. Download the raw `cofi` binary from the Releases page.
+2. Make it executable and move it to your path:
+   ```bash
+   chmod +x cofi
+   sudo mv cofi /usr/local/bin/
+   ```
+*(Note: You must have GTK4 installed on your system for the raw binary to work, e.g., `sudo pacman -S gtk4` on Arch).*
+
+---
+
+### Method 2: Manual Build & Install
 
 ```bash
 cd cofi
