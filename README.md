@@ -47,7 +47,7 @@ sudo install -Dm755 target/release/cofi /usr/local/bin/cofi
 
 ### Ubuntu / GNOME (Custom Shortcut)
 
-To bind `cofi` to a shortcut like `Ctrl+C` (or any other combo) in Ubuntu:
+To bind `cofi` to a shortcut like `Super+C` (or any other combo) in Ubuntu:
 1. Open **Settings** and go to **Keyboard**.
 2. Scroll down to **Keyboard Shortcuts** and click **View and Customize Shortcuts**.
 3. Scroll to the bottom and select **Custom Shortcuts**.
@@ -55,7 +55,7 @@ To bind `cofi` to a shortcut like `Ctrl+C` (or any other combo) in Ubuntu:
 5. Fill in the details:
    - **Name:** Cofi Launcher
    - **Command:** `/usr/local/bin/cofi`
-   - **Shortcut:** Click the "Set Shortcut" button and press `Ctrl+C` (or `Super+Space`).
+   - **Shortcut:** Click the "Set Shortcut" button and press `Super+C` (or `Super+Space`).
 6. Click **Add**. Now, whenever you press that combo, the launcher will instantly open!
 
 ### Hyprland
